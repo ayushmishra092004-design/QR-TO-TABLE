@@ -155,12 +155,16 @@ function setStatus(m, ok){ const s=$("status"); s.textContent=m; s.className="st
 const video = $("video"), canvas = document.createElement("canvas"), ctx = canvas.getContext("2d",{willReadFrequently:true});
 async function start(){
   try{
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"}}, audio:false});
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"}, width:{ideal:1280}, height:{ideal:720}}, audio:false});
     video.srcObject = stream; await video.play();
+    try{ await stream.getVideoTracks()[0].applyConstraints({advanced:[{focusMode:"continuous"}]}); }catch(e){}
     $("vw").classList.add("on"); $("startBtn").style.display="none"; $("stopBtn").style.display="";
     scanning = true; setStatus("Scanning…"); requestAnimationFrame(tick);
   }catch(e){
-    setStatus("Camera not available here ("+(e.name||"error")+"). Use the “phone camera app / photo” button instead.");
+    const msg = {NotAllowedError:"Camera permission is blocked. Tap the lock/site-settings icon in the address bar, set Camera to Allow, then reload.",
+      NotFoundError:"No camera found on this device.", NotReadableError:"Camera is in use by another app. Close it and retry.",
+      SecurityError:"Camera needs a secure (https) page."}[e.name] || ("Camera error: "+(e.name||"unknown"));
+    setStatus(msg+" You can also use the “phone camera app / photo” button.");
   }
 }
 function stop(){
@@ -168,17 +172,27 @@ function stop(){
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
   $("vw").classList.remove("on"); $("startBtn").style.display=""; $("stopBtn").style.display="none";
 }
-let lastText="", lastTime=0;
-function tick(){
+const nativeDet = ("BarcodeDetector" in window) ? new BarcodeDetector({formats:["qr_code"]}) : null;
+let lastText="", lastTime=0, busy=false, frames=0;
+async function decodeSource(src, w, h, maxSide, both){
+  if(nativeDet){ try{ const r = await nativeDet.detect(src); if(r.length) return r[0].rawValue; }catch(e){} }
+  const s = Math.min(1, maxSide/Math.max(w,h));
+  canvas.width = Math.round(w*s); canvas.height = Math.round(h*s);
+  ctx.drawImage(src,0,0,canvas.width,canvas.height);
+  const d = ctx.getImageData(0,0,canvas.width,canvas.height);
+  const c = jsQR(d.data,d.width,d.height,{inversionAttempts: both?"attemptBoth":"dontInvert"});
+  return c ? c.data : null;
+}
+async function tick(){
   if(!scanning) return;
-  if(video.readyState===video.HAVE_ENOUGH_DATA){
-    const s = Math.min(1, 640/video.videoWidth);
-    canvas.width = video.videoWidth*s; canvas.height = video.videoHeight*s;
-    ctx.drawImage(video,0,0,canvas.width,canvas.height);
-    const img = ctx.getImageData(0,0,canvas.width,canvas.height);
-    const code = jsQR(img.data, img.width, img.height, {inversionAttempts:"dontInvert"});
-    if(code && code.data && (code.data!==lastText || Date.now()-lastTime>2500)){
-      lastText = code.data; lastTime = Date.now(); addRecord(code.data);
+  if(video.readyState===video.HAVE_ENOUGH_DATA && !busy){
+    busy = true; frames++;
+    const text = await decodeSource(video, video.videoWidth, video.videoHeight, 1100, frames%4===0);
+    busy = false;
+    if(text && (text!==lastText || Date.now()-lastTime>2500)){
+      lastText = text; lastTime = Date.now(); addRecord(text);
+    } else if(!text && frames%60===0){
+      setStatus("Scanning… hold steady 15–30 cm away, fill the frame with the code, avoid glare.");
     }
   }
   requestAnimationFrame(tick);
@@ -188,13 +202,9 @@ function tick(){
 $("photo").addEventListener("change", e=>{
   const f = e.target.files[0]; if(!f) return;
   const img = new Image();
-  img.onload = ()=>{
-    const s = Math.min(1, 1200/Math.max(img.width,img.height));
-    canvas.width = img.width*s; canvas.height = img.height*s;
-    ctx.drawImage(img,0,0,canvas.width,canvas.height);
-    const d = ctx.getImageData(0,0,canvas.width,canvas.height);
-    const code = jsQR(d.data, d.width, d.height, {inversionAttempts:"attemptBoth"});
-    code ? addRecord(code.data) : setStatus("No QR code found in that photo. Try again closer and in better light.");
+  img.onload = async ()=>{
+    const text = await decodeSource(img, img.width, img.height, 1600, true);
+    text ? addRecord(text) : setStatus("No QR code found in that photo. Get closer so the code fills most of the frame, in good light.");
     URL.revokeObjectURL(img.src); e.target.value="";
   };
   img.src = URL.createObjectURL(f);
