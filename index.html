@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QR to Google Sheet Scanner</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#f6f7f9;--surface:#fff;--text:#1b1f24;--muted:#5d6672;--line:#dde1e6;--accent:#0b6bcb;--accent-text:#fff;--ok:#1a7f4b}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14171a;--surface:#1e2327;--text:#e8ebee;--muted:#9aa4ae;--line:#323a41;--accent:#4a9df0;--accent-text:#0a1722;--ok:#4cc38a}}
+:root[data-theme="dark"]{--bg:#14171a;--surface:#1e2327;--text:#e8ebee;--muted:#9aa4ae;--line:#323a41;--accent:#4a9df0;--accent-text:#0a1722;--ok:#4cc38a}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:860px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 12px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.video-wrap{position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:4/3;display:none}
+.video-wrap.on{display:block}
+video{width:100%;height:100%;object-fit:cover}
+.frame{position:absolute;inset:18%;border:3px solid #fff;border-radius:14px;opacity:.8;pointer-events:none}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+button,.btn{background:var(--accent);color:var(--accent-text);border:0;border-radius:8px;padding:10px 14px;font:inherit;font-weight:600;cursor:pointer}
+button.alt,.btn.alt{background:transparent;color:var(--text);border:1px solid var(--line)}
+input[type=file]{display:none}
+label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+select,input[type=text]{width:100%;padding:9px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit}
+.grid{display:grid;grid-template-columns:1fr 2fr;gap:10px}
+@media (max-width:520px){.grid{grid-template-columns:1fr}}
+.status{margin-top:10px;font-size:13px;color:var(--muted);min-height:20px}
+.status.ok{color:var(--ok)}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;white-space:nowrap}
+th{background:var(--bg)}
+td.empty{text-align:center;color:var(--muted);white-space:normal}
+textarea{width:100%;height:100px;margin-top:10px;background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>QR → Table → Google Sheet</h1>
+
+<div class="card">
+  <div class="video-wrap" id="vw"><video id="video" playsinline muted></video><div class="frame"></div></div>
+  <div class="row">
+    <button id="startBtn">Start live scan</button>
+    <button id="stopBtn" class="alt" style="display:none">Stop</button>
+    <label class="btn alt" for="photo">Use phone camera app / photo</label>
+    <input type="file" id="photo" accept="image/*" capture="environment">
+  </div>
+  <div class="status" id="status">Point the camera at a QR code.</div>
+
+  <div class="grid">
+    <div>
+      <label for="delim">Split data by</label>
+      <select id="delim">
+        <option value="auto">Auto-detect</option>
+        <option value=",">Comma ,</option>
+        <option value="|">Pipe |</option>
+        <option value=";">Semicolon ;</option>
+        <option value="\t">Tab</option>
+        <option value="\n">New line</option>
+      </select>
+    </div>
+    <div>
+      <label for="names">Column names (optional, comma-separated)</label>
+      <input type="text" id="names" placeholder="e.g. ID, Name, Class, Phone">
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <strong>Google Sheet</strong>
+  <label for="sheetUrl">Apps Script Web App URL</label>
+  <input type="text" id="sheetUrl" placeholder="https://script.google.com/macros/s/.../exec">
+  <div class="row">
+    <label style="margin:0;display:flex;align-items:center;gap:6px"><input type="checkbox" id="autoSend" checked> Send every scan automatically</label>
+    <button id="sendAllBtn" class="alt">Send all rows</button>
+  </div>
+  <div class="status" id="sheetStatus">Paste your Web App URL to start sending scans to your sheet.</div>
+</div>
+
+<div class="card">
+  <div class="scroll"><table id="tbl"></table></div>
+  <div class="row">
+    <button id="copyBtn">Copy table (paste into Excel / Sheets)</button>
+    <button id="csvBtn" class="alt">Show CSV</button>
+    <button id="clearBtn" class="alt">Clear</button>
+  </div>
+  <textarea id="out" readonly></textarea>
+</div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+let headers = [], rows = [], seen = new Set(), stream = null, scanning = false;
+
+// ---- persistence (per-device convenience) ----
+function save(){ try{ localStorage.setItem("qrtable", JSON.stringify({headers, rows})); }catch(e){} }
+function load(){ try{ const d = JSON.parse(localStorage.getItem("qrtable")||"null");
+  if(d){ headers=d.headers; rows=d.rows; rows.forEach(r=>seen.add(r.__raw)); } }catch(e){} }
+
+// ---- parsing: returns array of [key, value] ----
+function parse(text){
+  const t = text.trim();
+  // 1. JSON
+  try{
+    const j = JSON.parse(t);
+    if(j && typeof j==="object" && !Array.isArray(j))
+      return Object.entries(j).map(([k,v])=>[k, typeof v==="object"?JSON.stringify(v):String(v)]);
+    if(Array.isArray(j)) return j.map((v,i)=>[colName(i), String(v)]);
+  }catch(e){}
+  // 2. key:value or key=value lines (e.g. "Name: Ravi\nID: 12")
+  const lines = t.split(/\r?\n/).filter(Boolean);
+  if(lines.length>1 && lines.every(l=>/^[^:=]+[:=].+/.test(l)))
+    return lines.map(l=>{ const i = l.search(/[:=]/); return [l.slice(0,i).trim(), l.slice(i+1).trim()]; });
+  // 3. delimited values
+  let d = $("delim").value;
+  if(d==="\\t") d = "\t"; if(d==="\\n") d = "\n";
+  if(d==="auto") d = ["|",";","\t",",","\n"].find(c=>t.includes(c)) || ",";
+  return t.split(d).map((v,i)=>[colName(i), v.trim()]);
+}
+function colName(i){
+  const names = $("names").value.split(",").map(s=>s.trim()).filter(Boolean);
+  return names[i] || "Column "+(i+1);
+}
+
+// ---- table ----
+function addRecord(text){
+  if(seen.has(text)){ setStatus("Already scanned – skipped.", false); return false; }
+  seen.add(text);
+  const row = {__raw:text};
+  parse(text).forEach(([k,v])=>{ if(!headers.includes(k)) headers.push(k); row[k]=v; });
+  rows.push(row); save(); render(); if($('autoSend').checked) sendRows([row]);
+  setStatus("Added row "+rows.length+" ✔", true);
+  try{ navigator.vibrate && navigator.vibrate(120); }catch(e){}
+  return true;
+}
+function render(){
+  const t = $("tbl");
+  if(!rows.length){ t.innerHTML = '<tr><td class="empty">No scans yet.</td></tr>'; return; }
+  const esc = s => String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  t.innerHTML = "<thead><tr><th>#</th>"+headers.map(h=>"<th>"+esc(h)+"</th>").join("")+"</tr></thead><tbody>"+
+    rows.map((r,i)=>"<tr><td>"+(i+1)+"</td>"+headers.map(h=>"<td>"+esc(r[h])+"</td>").join("")+"</tr>").join("")+"</tbody>";
+}
+function toText(sep){
+  const q = v => sep===","? '"'+String(v??"").replace(/"/g,'""')+'"' : String(v??"").replace(/[\t\n]/g," ");
+  return [headers, ...rows.map(r=>headers.map(h=>r[h]))].map(a=>a.map(q).join(sep)).join("\n");
+}
+function setStatus(m, ok){ const s=$("status"); s.textContent=m; s.className="status"+(ok?" ok":""); }
+
+// ---- live camera scan ----
+const video = $("video"), canvas = document.createElement("canvas"), ctx = canvas.getContext("2d",{willReadFrequently:true});
+async function start(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"}}, audio:false});
+    video.srcObject = stream; await video.play();
+    $("vw").classList.add("on"); $("startBtn").style.display="none"; $("stopBtn").style.display="";
+    scanning = true; setStatus("Scanning…"); requestAnimationFrame(tick);
+  }catch(e){
+    setStatus("Camera not available here ("+(e.name||"error")+"). Use the “phone camera app / photo” button instead.");
+  }
+}
+function stop(){
+  scanning = false;
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  $("vw").classList.remove("on"); $("startBtn").style.display=""; $("stopBtn").style.display="none";
+}
+let lastText="", lastTime=0;
+function tick(){
+  if(!scanning) return;
+  if(video.readyState===video.HAVE_ENOUGH_DATA){
+    const s = Math.min(1, 640/video.videoWidth);
+    canvas.width = video.videoWidth*s; canvas.height = video.videoHeight*s;
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    const img = ctx.getImageData(0,0,canvas.width,canvas.height);
+    const code = jsQR(img.data, img.width, img.height, {inversionAttempts:"dontInvert"});
+    if(code && code.data && (code.data!==lastText || Date.now()-lastTime>2500)){
+      lastText = code.data; lastTime = Date.now(); addRecord(code.data);
+    }
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---- photo from phone camera app ----
+$("photo").addEventListener("change", e=>{
+  const f = e.target.files[0]; if(!f) return;
+  const img = new Image();
+  img.onload = ()=>{
+    const s = Math.min(1, 1200/Math.max(img.width,img.height));
+    canvas.width = img.width*s; canvas.height = img.height*s;
+    ctx.drawImage(img,0,0,canvas.width,canvas.height);
+    const d = ctx.getImageData(0,0,canvas.width,canvas.height);
+    const code = jsQR(d.data, d.width, d.height, {inversionAttempts:"attemptBoth"});
+    code ? addRecord(code.data) : setStatus("No QR code found in that photo. Try again closer and in better light.");
+    URL.revokeObjectURL(img.src); e.target.value="";
+  };
+  img.src = URL.createObjectURL(f);
+});
+
+// ---- Google Sheets ----
+function sheetStatus(m, ok){ const e=$("sheetStatus"); e.textContent=m; e.className="status"+(ok?" ok":""); }
+$("sheetUrl").value = (()=>{ try{return localStorage.getItem("sheetUrl")||"";}catch(e){return "";} })();
+$("sheetUrl").addEventListener("change", ()=>{ try{localStorage.setItem("sheetUrl",$("sheetUrl").value.trim());}catch(e){} });
+async function sendRows(list){
+  const url = $("sheetUrl").value.trim();
+  if(!url){ sheetStatus("Add your Web App URL above to send to Google Sheets."); return; }
+  const body = JSON.stringify({headers, rows:list.map(r=>headers.map(h=>r[h]??""))});
+  sheetStatus("Sending…");
+  try{
+    const res = await fetch(url,{method:"POST", body});          // text/plain, no preflight
+    const j = await res.json();
+    j.ok ? sheetStatus("Saved to Google Sheet ✔ ("+list.length+" row"+(list.length>1?"s":"")+")", true)
+         : sheetStatus("Sheet error: "+(j.error||"unknown"));
+  }catch(e){
+    try{ await fetch(url,{method:"POST", body, mode:"no-cors"});
+         sheetStatus("Sent (could not confirm). Check your sheet.", true); }
+    catch(e2){ sheetStatus("Could not reach Google. Check internet and the URL."); }
+  }
+}
+$("sendAllBtn").onclick = ()=>{ rows.length ? sendRows(rows) : sheetStatus("No rows to send yet."); };
+
+// ---- buttons ----
+$("startBtn").onclick = start;
+$("stopBtn").onclick = stop;
+$("clearBtn").onclick = ()=>{ if(confirm("Clear all rows?")){ headers=[]; rows=[]; seen.clear(); save(); render(); $("out").style.display="none"; } };
+$("csvBtn").onclick = ()=>{ const o=$("out"); o.value=toText(","); o.style.display="block"; o.select(); };
+$("copyBtn").onclick = async ()=>{
+  try{ await navigator.clipboard.writeText(toText("\t")); setStatus("Copied! Paste into Excel or Google Sheets.", true); }
+  catch(e){ const o=$("out"); o.value=toText("\t"); o.style.display="block"; o.select(); setStatus("Select and copy the text below."); }
+};
+
+load(); render();
+</script>
+</body>
+</html>
